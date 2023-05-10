@@ -21,6 +21,7 @@
 
 #define rows 5
 #define cols 4
+#define long_press_time 2000  // hold key for 2 seconds for long press to enter menus
 
 char keys[rows][cols] = {
   {'D','C','B','A'},
@@ -63,12 +64,25 @@ SSOLED dispR;
 
 //////////////////////////////////////////////////////////////////////////
 
-enum modes {
+enum MODES {
+  SETUP,       // only used for setup
   ROUTINE,
   UNITS_MENU,
   SETTINGS_MENU
 } DEVICE_MODE;
 
+enum SUBMENUS {
+  NONE,
+  POWER,
+  ADVANCED,
+  CUSTOM
+} SUB_MENU;
+
+enum CUSTOMMENU {
+  UNIT_1,
+  UNIT_2,
+  SCALAR
+} CUSTOM_MENU;
 
 /////////////////////////////////////////////////////////////////////////////
 
@@ -121,47 +135,66 @@ UNITS_STRUCT activeUnits[4] = {
 
 #define wakeUpPin 2       // hardware interrupt INT0
 #define wakeUpPin_GND 12
+#define sleepSelectionOverride 5 // 10 mins
 
 unsigned long idleTime = millis();
 volatile bool run_wakeUp;
 
 unsigned long checkBattTime = millis();
 
-struct power_settings {
-  unsigned long
-}
+struct PWR_SETTINGS {
+  unsigned long timer;
+  char text[7];
+};
 
+uint8_t sleepSelectionHolder;
 uint8_t sleepSelection = 2;
-unsigned long sleepTimer[] = { // time in ms before idle device goes to sleep
-  10000,        // 0: 10s
-  30000,        // 1: 30s
-  60000,        // 2: 1 min
-  120000,       // 3: 2 min
-  300000,       // 4: 5 min
-  600000,       // 5: 10 min
-  //4000000000,   // 6: NEVER (1111 hours functionally never)
+PWR_SETTINGS sleepTimer[] = {
+  { 10000,  "10 sec" },      
+  { 30000,  "30 sec" },      
+  { 60000,  " 1 min" },       
+  { 120000, " 2 min" },    
+  { 300000, " 5 min" },      
+  { 600000, "10 min" },
+  //{ 4000000000, "NEVER "}, //1111 hours functionally never
+};
+
+uint8_t dimSelection = 2;
+PWR_SETTINGS dimTimer[] = {     
+  { 30000,  " 5 sec" },      
+  { 60000,  "10 sec" },       
+  { 120000, "30 sec" },    
+  { 300000, " 1 min" },      
+  { 4000000000, "NEVER "}, //1111 hours functionally never
 };
 
 bool checkTimeForSleep(){
   // returns TRUE for time to put device to sleep. Happens if you go too long without pressing an input
   // returns FALSE for stay awake
-
-  // Serial.print(idleTime);
-  // Serial.print("        ");
-  // Serial.println(millis());
-  if(millis() - idleTime > sleepTimer[sleepSelection]){    
+  if(millis() - idleTime > sleepTimer[sleepSelection].timer){    
     return 1;
   } else {
     return 0;
   }
 }
 
+// STILL GOTTA TEST THIS WITH SOME SERIAL PRINTS
+// May still cause problems if the device times out and shuts down, since sleep selection will be overridden.
+bool sleepDelayTrigger = 1;
+void delaySleep(bool flag){
+  if (flag && sleepDelayTrigger) {
+    sleepSelectionHolder = sleepSelection;
+    sleepSelection = sleepSelectionOverride;
+    sleepDelayTrigger = 0;
+  } else if (!flag){
+  sleepSelection = sleepSelectionHolder;
+  sleepDelayTrigger = 1;
+  }
+}
+
 void gotoSleep(){
   // saves settings to EEPROM
   // puts the device to sleep
-
-  // oledFill(&dispL,0);
-  // oledFill(&dispR,0);
 
   oledPower(&dispL,0);
   oledPower(&dispR,0);
@@ -187,16 +220,12 @@ void wakeUp(){
   // called by interrupt :: wakes the device up
   // turns off interrupt button, turns on the displays, continues back to loop
   // undimms displays if necessary
-  // does math and prints result to "prime" the displays
-
-  oledPower(&dispL,1); // turn displays on
-  oledPower(&dispR,1);
-
-  run_wakeUp = false; // reset run_wakeUp
-
-  pinMode(wakeUpPin_GND,INPUT);
 
   Serial.println("*****WAKE UP******");
+
+  pinMode(wakeUpPin_GND,INPUT); // turn interrupt button off
+
+  run_wakeUp = false; // reset run_wakeUp
 
   // just after wake up, idle time is still high, so device would go right back to sleep in a death loop if keypad doesnt detect press for some reason
   idleTime = millis();  // reset idle time? n YOU SHOULD THIS ONLY WORKS BECAUSE WHEN YOU GO BACK TO LOOP KEYPAD DETECTS ENTER KEY PRESSED!
@@ -204,12 +233,14 @@ void wakeUp(){
 
   fillVoltageArr();
 
-  DEVICE_MODE = ROUTINE;
-  routine_Displays(); // currently needed so if gotosleep is called while still in a menu, the menu elements wont be on screen on startup. could fix this for the most part by temporarily forcing
+  oledPower(&dispL,1); // turn displays on
+  oledPower(&dispR,1);
+
   //checksleep millis counter to 10 minutes or something. then on exit, change the value back??? might be nice since you dont necessarily want the device sleepign every time you go to change settings
-
-  //if(checkLowBattery()){gotoSleep();}
-
+  if (DEVICE_MODE != ROUTINE){ // clear display and start normal mode
+    DEVICE_MODE = ROUTINE;
+    routine_Displays();
+  }
 }
 
 void dimDisplay(){    // NEED TO SEE IF DIM DISPLAY SAVES ANY POWER OR NOT BEFORE IMPLEMENTING!!!!
@@ -332,7 +363,6 @@ void displayLowBatteryWarning(bool print){
 }
 
 
-
 //------------------------------------------------------//
 //
 //               MATH FUNCTIONS
@@ -364,18 +394,10 @@ void selectUnit () {            // sets current conversion to appropriate index 
   } else {
       selectedUnit = 3;
   }
-
-  //Serial.println(key);
-  //Serial.print("Selected Unit Changed to: ");
-  //Serial.println(selectedUnit);
 }
 
 void invertConversion(){        // changes conversion direction for selected unit and stores in array to be saved
   conversionDirection[selectedUnit] = !conversionDirection[selectedUnit];
-
-  //Serial.print("Unti # ");
-  //Serial.print(selectedUnit);
-  //Serial.println(" inverted!");
 }
 
 void setCurrentValue(){         // adds key to next index of currentValue char array
@@ -393,7 +415,7 @@ void setCurrentValue(){         // adds key to next index of currentValue char a
   }
 }
 
-void resetCurrentValue(){       // LATER ON ADD FUNCTIONALITY TO HIGHLIGHT CURRENT TEXT ON OLED TO SHOW ITS READY FOR DELETION
+void resetCurrentValue(){       // resets current value and reinitializes formatting flags
   memset(currentValue,'\0',inputStringLength);  //reset currentValue to null
   currentValueIndex=0;
   containsRadix=false;
@@ -429,7 +451,6 @@ void doMath(){                  // do multiply or do divide
 
 void resultChar(){              // do all output formatting of result
   //resultChar handles the output formatting -- taking in the output float and displaying a result max 6 digits long or scientific if necessary
-  //converting float output to char is necessary for clean max 6 digit formatting
 
   long leadingDigits = (long)result_numeric;
   bool longFormatOverride = longFormat;                          // there to override user selected short/long format. can remove if I dont want the option to choose
@@ -568,11 +589,17 @@ void serialPrintReset(){        // indicate value has been reset
 }
 
 void drawSettingsMenu() {
-  drawsleepSelection();
+  drawSleepSelection();
   drawDimSelection();
   drawFormatSelection();
   drawButtonRow_Settings();
   drawBatteryStatus();
+}
+
+void drawUnitsMenu() {
+
+  drawButtonRow_Units();
+
 }
 
 void drawButtonRow_Settings(){
@@ -582,26 +609,17 @@ void drawButtonRow_Settings(){
   oledWriteString(&dispR, 0,65,6, "EXIT", SETTINGS_SIZE, 0, 1);  
 }
 
-void drawsleepSelection(){
-  // could have done this as a struct but im lazy
-  // 10000,        // 0: 10s
-  // 30000,        // 1: 30s
-  // 60000,        // 2: 1 min
-  // 120000,       // 3: 2 min
-  // 300000,       // 4: 5 min
-  // 600000,       // 5: 10 min
+void drawButtonRow_Units(){
+  oledWriteString(&dispL, 0,0,6, "PREV", SETTINGS_SIZE, 0, 1);  
+  oledWriteString(&dispL, 0,65,6, "NEXT", SETTINGS_SIZE, 0, 1);  
+  oledWriteString(&dispR, 0,0,6, "CUSTOM", SETTINGS_SIZE, 0, 1);  
+  oledWriteString(&dispR, 0,65,6, "EXIT", SETTINGS_SIZE, 0, 1);  
+}
 
+void drawSleepSelection(){
   #define xpos 0
   #define ypos 3
-
-  switch (sleepSelection) {
-    case 0: oledWriteString(&dispL, 0,xpos,ypos, "10 sec", SETTINGS_SIZE, 0, 1);break;
-    case 1: oledWriteString(&dispL, 0,xpos,ypos, "30 sec", SETTINGS_SIZE, 0, 1);break;
-    case 2: oledWriteString(&dispL, 0,xpos,ypos, " 1 min", SETTINGS_SIZE, 0, 1);break;
-    case 3: oledWriteString(&dispL, 0,xpos,ypos, " 2 min", SETTINGS_SIZE, 0, 1);break;
-    case 4: oledWriteString(&dispL, 0,xpos,ypos, " 5 min", SETTINGS_SIZE, 0, 1);break;
-    case 5: oledWriteString(&dispL, 0,xpos,ypos, "10 min", SETTINGS_SIZE, 0, 1);break;
-  }
+  oledWriteString(&dispL, 0,xpos,ypos, sleepTimer[sleepSelection].text, SETTINGS_SIZE, 0, 1);
 }
 
 void drawDimSelection(){
@@ -617,7 +635,7 @@ void drawFormatSelection(){
 }
 
 void drawBatteryStatus(){
-
+// empty
 }
 
 
@@ -627,12 +645,7 @@ void drawBatteryStatus(){
 //
 //------------------------------------------------------//
 
-// enum modes {
-//   ROUTINE,
-//   UNITS_MENU,
-//   SETTINGS_MENU
-// } DEVICE_MODE;
-
+// Menu and Submenu ENUMS defines at top of file
 
 void enter_menus(KeypadEvent key){
   if (tenKey.getState() == HOLD && DEVICE_MODE == ROUTINE) {
@@ -640,6 +653,8 @@ void enter_menus(KeypadEvent key){
       case 'A': case 'B': case 'C': case 'D':
         Serial.println("UNITS");
         DEVICE_MODE = UNITS_MENU;
+        clearDisplays();
+        drawUnitsMenu();
         break;
       case '.':
         Serial.println("SETTINGS");
@@ -654,42 +669,83 @@ void enter_menus(KeypadEvent key){
   }
 }
 
-void settings_menu(){
-
-
-  switch (key){
-    case 'A':
-      Serial.println("SLEEP TIMER");
-      sleepSelection++;
-      if (sleepSelection > 5){sleepSelection = 0;}
-      drawsleepSelection();
-      Serial.println(sleepTimer[sleepSelection]);
-      break;
-    case 'B':
-      // Serial.println("DIM TIMER");
-      Serial.println("DIM");
-      //gotoSleep();
-      break;      
-    case 'C':
-      Serial.println("FORMAT");
-        longFormat = !longFormat;
-        drawFormatSelection();
-        if (!longFormat) {
-          Serial.println("Short Format Selected");
-        } else {
-          Serial.println("Long Format Selected");
-        }
-      break;
-
-    case 'D':
-      Serial.println("EXIT");
-      DEVICE_MODE = ROUTINE;
-      routine_Displays();
-      break;
+void units_menu_selector(){
+  if(SUB_MENU == NONE) {
+    units_menu();
+  } else if (SUB_MENU == CUSTOM) {
+    custom_units_menu();
   }
-
 }
 
+void settings_menu(){
+  switch (key){
+    case 'A':   // SLEEP SETTINGS
+      Serial.println("SLEEP TIMER");
+      
+      sleepSelection++;
+      if (sleepSelection > 5){sleepSelection = 0;}
+      drawSleepSelection();
+      break;
+    case 'B':   // DIM SETTINGS
+      Serial.println("DIM TIMER");
+      //empty
+      break;      
+    case 'C':   // OUTPUT FORMAT SETTINGS
+      Serial.println("FORMAT");
+      
+      longFormat = !longFormat;
+      drawFormatSelection();
+      break;
+    case 'D':   // EXIT TO MAIN MENU
+      Serial.println("EXIT");
+      
+      DEVICE_MODE = ROUTINE;
+      routine_Displays();
+      delaySleep(0);
+      break;
+  }
+}
+
+void units_menu(){
+
+    switch (key){
+    case 'A':   // INCREMENT DOWN STORED UNITS STRUCT
+      Serial.println("DECREMENT");
+      
+      // sleepSelection++;
+      // if (sleepSelection > 5){sleepSelection = 0;}
+
+      break;
+    case 'B':   // INCREMENT UP STORED UNITS STRUCT
+      Serial.println("INCREMENT");
+      //empty
+      break;      
+    case 'C':   // RUN INPUT CUSTOM UNITS SCRIPT
+      Serial.println("CUSTOM");
+      clearDisplays();
+      SUB_MENU = CUSTOM;
+      custom_units_menu();
+      break;
+    case 'D':   // EXIT TO MAIN MENU
+      Serial.println("EXIT");
+      
+      SUB_MENU = NONE;
+      DEVICE_MODE = ROUTINE;
+      routine_Displays();
+      delaySleep(0);
+      break;
+  }
+}
+
+void custom_units_menu(){
+  Serial.println("ENTER CUSTOM UNITS MENU");
+  if (key == 'D'){
+    SUB_MENU = NONE;
+    DEVICE_MODE = ROUTINE;
+    routine_Displays();
+    delaySleep(0);
+  }
+}
 
 /////////////////////////////////////////////////////////////////////////////////////////////////
 
@@ -700,40 +756,30 @@ void settings_menu(){
 //
 //-----------------------------------------------------//
 
-
 void setup() {
-  Serial.begin(9600);
 
-  ///////// CONSIDER CHANGING SETUP SO IT RUNS WAKEUP INSTEAD OF DUPLICATING COMMANDS BETWEEN SETUP AND WAKEUP ////////////
+  Serial.begin(9600);
 
   // initialize Pin 2 for use as external interrupt
   pinMode(wakeUpPin, INPUT_PULLUP);
   pinMode(voltageSensePin, INPUT);
 
-  // something funny happens when attachInterrupt is done only in setup. move back to gotoSleep and surround lowPower.powerDown. maybe investigate further later if it breaks here, it could break there too. 
-  // appears to be an issue in oled library????
-  // pinMode(wakeUpPin_GND,INPUT);
-  // attachInterrupt(digitalPinToInterrupt(wakeUpPin), wakeUp_ISR, LOW);
+  // initialize keyboard settings
+  tenKey.addEventListener(enter_menus);
+  tenKey.setHoldTime(long_press_time);
 
   // initialize OLED displays
-  //oledInit(SSOLED *, type, oled_addr, rotate180, invert, bWire, SDA_PIN, SCL_PIN, RESET_PIN, speed)
+  // oledInit(SSOLED *, type, oled_addr, rotate180, invert, bWire, SDA_PIN, SCL_PIN, RESET_PIN, speed)
   oledInit(&dispL, displaySize_L, I2C_Address_L, flipDisplay_L, invertDisplay_L, USE_HW_I2C_L, SDA_L, SCL_L, displayResetPin, 400000L); // 400kHz
   oledInit(&dispR, displaySize_R, I2C_Address_R, flipDisplay_R, invertDisplay_R, USE_HW_I2C_R, SDA_R, SCL_R, displayResetPin, 400000L); // 400kHz
   oledFill(&dispL, 0, 1);
   oledFill(&dispR, 0, 1);
 
-  // // initialize display with units and math
-  doMath();
-  updateDisplayValues();
-  updateDisplayUnits(); 
+  // Forces wakeUp to run DEVICE_MODE code
+  DEVICE_MODE = SETUP;
 
-  fillVoltageArr();
-
-  tenKey.addEventListener(enter_menus);
-  tenKey.setHoldTime(1000);
-  
-  DEVICE_MODE = ROUTINE;
-
+  // do wakeUp
+  wakeUp();
 }
 
 //------------------------------------------------------//
@@ -745,6 +791,7 @@ void setup() {
 
 void loop() {
 
+  // do wakeUp?
   if(run_wakeUp){wakeUp();}
 
   key = tenKey.getKey();
@@ -756,16 +803,19 @@ void loop() {
     switch (DEVICE_MODE){
 
       case SETTINGS_MENU:
+        delaySleep(1); // still untested code
         settings_menu();
         break;
 
       case UNITS_MENU:
+        delaySleep(1);
+        units_menu_selector();
         break;
 
       case ROUTINE:
           switch (key){
 
-                case 'd': case 'l': break; // SKIP UNUSED KEYS
+                case 'd': case 'l': case 'u': break; // SKIP UNUSED KEYS
                 case 'A': case 'B': case 'C': case 'D':
                   selectUnit(); 
                   doMath();        
@@ -786,41 +836,23 @@ void loop() {
                   updateDisplayValues();
                   break;
 
-                case 'u': // remove later
-
-
-                  break;
-
                 default:
                   setCurrentValue();
                   doMath();
                   updateDisplayValues();
                 }
 
-
-
-
           break;
-
-
-
     }
-
-   
-
-
- 
- 
- 
- 
   }
 
+  // do Sleep?
   if(checkTimeForSleep() || checkLowBattery()){
     delay(500);  // not so fast
     gotoSleep();
   }
 
-  delay(50);
+  delay(50); // keep a pace
 }
 
 
@@ -852,7 +884,10 @@ void loop() {
 /*/
 
 
-
+  // something funny happens when attachInterrupt is done only in setup. move back to gotoSleep and surround lowPower.powerDown. maybe investigate further later if it breaks here, it could break there too. 
+  // appears to be an issue in oled library????
+  // pinMode(wakeUpPin_GND,INPUT);
+  // attachInterrupt(digitalPinToInterrupt(wakeUpPin), wakeUp_ISR, LOW);
 
 
 
