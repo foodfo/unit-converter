@@ -2,6 +2,8 @@
 // Keypad Setup ------------------------------
 // Display Setup -----------------------------
 /////////////////////// KEYPAD SETUP ///////////////////////
+/////////////////////////////////////////////////////////////////////////////
+
 
 ///////////////////////////////////////////////////////////////////////////////////////////////////////
 //------------------------------------------------------//
@@ -28,6 +30,44 @@ variables are all camelCase
 #include <BitBang_I2C.h>
 #include <LowPower.h>
 
+/////////////////////// ENABLE/DISABLE SERIAL MONITOR ///////////////////////
+
+#define VIEW 1      // used for viewing typical output of display, can replace OLEDS
+#define DEBUG 1     // used for debugging - typically lower level code
+
+#if VIEW == 1
+#define view(x) Serial.print(x)
+#define viewln(x) Serial.println(x)
+#define viewF(x) Serial.print(x,6)    // prints floats
+#define viewS Serial.print("      ")  // prints spaces
+#else
+#define view(x)
+#define viewln(x)
+#define viewF(x)
+#define viewS
+#endif
+
+#if DEBUG == 0
+#define debug(x) Serial.print(x)
+#define debugln(x) Serial.println(x)
+#define debugF(x) Serial.print(x,6)
+#define debugS Serial.print("      ")
+#else
+#define debug(x)
+#define debugln(x)
+#define debugF(x)
+#define debugS
+#endif
+
+#if VIEW == 1 || DEBUG == 1
+#define startSerial Serial.begin(9600)
+#define serial_print serialPrint()
+#define serial_print_reset serialPrintReset()
+#else 
+#define startSerial 
+#define serial_print
+#define serial_print_reset
+#endif
 /////////////////////// INITIALIZE KEYPAD ///////////////////////
 
 #define rows 5
@@ -74,27 +114,17 @@ SSOLED dispL, dispR;
 
 ///////////////////////////// ENUMS /////////////////////////////
 
-enum MODES {
+enum DEVICE_STATES {
   SETUP,
-  MAIN,
-  UNITS_MENU,
-  SETTINGS_MENU
-} DEVICE_MODE;
-
-enum SUBMENUS {
-  NONE,
-  POWER,
-  ADVANCED,
-  CUSTOM
-} SUB_MENU;
-
-enum CUSTOMMENU {
-  UNIT_1,
-  UNIT_2,
-  SCALAR
-} CUSTOM_MENU;
-
-/////////////////////////////////////////////////////////////////////////////
+  MATH,
+  SETTINGS_MAIN,
+  SETTINGS_PWR,
+  SETTINGS_ADV,
+  UNITS_MAIN,
+  UNITS_UNIT1,
+  UNITS_UNIT2,
+  UNITS_CONVERT,
+} STATE, LAST_STATE;
 
 
 //------------------------------------------------------//
@@ -108,7 +138,7 @@ enum CUSTOMMENU {
 // SAVED SETTINGS - current selections
 uint8_t currentUnit = 0;
 bool conversionDirection[4] = { 1, 1, 1, 1 };  // true is multiply, false is divide
-uint8_t activeUnitsIndex[4] = { 0, 1, 5, 6 };  // MODIFY THIS ARRAY TO CHOOSE UNITS FROM STORED UNITS
+uint8_t activeUnitsIndex[4] = { 0, 7, 5, 6 };  // MODIFY THIS ARRAY TO CHOOSE UNITS FROM STORED UNITS
 bool longFormat = false;                       // false is short format, true is long format. short format is default
 
 // UNIT MATRIX
@@ -122,14 +152,17 @@ struct UNITS_STRUCT {
 
 UNITS_STRUCT UNITS_LIST[30] = {
   // dont forget to add a 0 if the user doesnt add a .0 to the end. otherwise math wont be float?  also, add leading spaces to units for formatting
-  { "  in", "  mm", 0, 25.4 },     // 0   ---- 1 unit1 = 1 unit2 * conversion
-  { "  yd", "  ft", 0, 3.0 },      // 1
-  { "  kg", " lbf", 0, 2.2 },      // 2
-  { "knot", " mph", 0, 1.15078 },  // 3
-  { " ksi", " mPa", 0, 6.89476 },  // 4
-  { "  Nm", "lbft", 0, .7376 },    // 5
-  { "smol", " big", 0, 91684 }     // 6
+  { "  in", "  mm", 0, 25.4 },      // 0   ---- 1 unit1 = 1 unit2 * conversion
+  { "  yd", "  ft", 0, 3.0 },       // 1
+  { "  kg", " lbf", 0, 2.2 },       // 2
+  { "knot", " mph", 0, 1.15078 },   // 3
+  { " ksi", " mPa", 0, 6.89476 },   // 4
+  { "  Nm", "lbft", 0, .7376 },     // 5
+  { "smol", " big", 0, 91684 },     // 6
+  { "diam", "area", 4, 1.0}         // 7
 };
+
+//UNITS_STRUCT LIST_HOLDER[30]; // this shoots us from 75% memory allocation to 97% memory allocation!!! gotta figure out how to flash eeprom without storing this data or something....
 
 //store values from eeprom locally for speed
 UNITS_STRUCT activeUnits[4] = {
@@ -186,7 +219,7 @@ bool checkSleep() {                 // checks to see if device has been idle too
   unsigned long checkTimer;
 
   // delays sleep if you're in a menu
-  if (DEVICE_MODE == MAIN) {
+  if (STATE == MATH) {
     checkTimer = sleepTimer[sleepSetting].time;
   } else {
     checkTimer = sleepSetting_Override;
@@ -209,7 +242,7 @@ void sleep() {                      // saves settings and puts the device to sle
   pinMode(wakeUpPin_GND, OUTPUT);
   digitalWrite(wakeUpPin_GND, LOW);
 
-  Serial.println("*****POWER DOWN******");
+  viewln("*****POWER DOWN******");
   delay(100);
 
   attachInterrupt(digitalPinToInterrupt(wakeUpPin), wakeUp_ISR, LOW);
@@ -227,7 +260,7 @@ void wakeUp() {                     // wake the device up, reset timers, initial
   // turns off interrupt button, turns on the displays, continues back to loop
   // undimms displays if necessary
 
-  Serial.println("*****WAKE UP******");
+  viewln("*****WAKE UP******");
 
   pinMode(wakeUpPin_GND, INPUT);  // turn interrupt button off
 
@@ -244,9 +277,9 @@ void wakeUp() {                     // wake the device up, reset timers, initial
   oledPower(&dispL, 1);  // turn displays on
   oledPower(&dispR, 1);
 
-  if (DEVICE_MODE != MAIN) {  // clear display and start normal mode
-    DEVICE_MODE = MAIN;
-    math_Displays(); // draw_MainDisplays?
+  if (STATE != MATH) {  // clear display and start normal mode
+    STATE = MATH;
+    math_Displays(); // draw_MATHDisplays?
   }
 }
 
@@ -270,7 +303,7 @@ void dimDisplay() {                 // dim displays after set time to save power
 #define volt_divider_R1 100.0   // kilo Ohms :: 100 kO
 #define volt_divider_R2 100.0
 
-#define battCheckDelayTime 3000  // only check battery every 30 seconds! does less float math and lets battery voltage average out
+#define battCheckDelayTime 10000  // only check battery every 30 seconds! does less float math and lets battery voltage average out
 #define skipCheckTime 60000     // skip the battery check if idleTime is less than 1 min
 #define voltage_correction_factor 94  // (real voltage / analog read voltage) * 100  -----> 93.6% = 94
 #define weight 20                     // Weight for EWMA :: 0 - 100. Higher values add more weight to newer readings
@@ -285,17 +318,17 @@ void getBatteryVoltage() {          // get current battery voltage using Exp Wei
 
   batteryVoltage = rawVoltage() * 100.0;  // convert float voltage to 3 digit cV output :: 4.235645 ---->  424
 
-  // Serial.print(rawVoltage(), 5);
-  // Serial.print("         ");
-  // Serial.print(batteryVoltage);
-  // Serial.print("         ");
+  debugF(rawVoltage());
+  debug("         ");
+  debug(batteryVoltage);
+  debug("         ");
 
   batteryVoltage = weight * batteryVoltage + (100 - weight) * prev_batteryVoltage;
   batteryVoltage /= 100;
 
   prev_batteryVoltage = batteryVoltage;
 
-  //Serial.println(batteryVoltage);
+  debugln(batteryVoltage);
 
 }
 
@@ -329,10 +362,11 @@ bool checkLowBattery() {            // checks for low voltage or warning voltage
 
     getBatteryVoltage();
 
-    Serial.println(batteryVoltage);
+    view("Volts:   ");
+    viewln(batteryVoltage);
 
     if (batteryVoltage < shutdownVoltage) {
-      Serial.println("BATTERY LOW");
+      viewln("BATTERY LOW");
       return 1;
       } else if (batteryVoltage < warningVoltage) {
       displayLowBatteryWarning(1);
@@ -363,22 +397,22 @@ void displayLowBatteryWarning(bool print) {
 //
 //-----------------------------------------------------//
 
-#define inputStringLength 8  // max digits = 6. add +1 for decimal. add +1 for null terminator '/0'
-#define outputStringLength 8
-#define zeros "0.00000"  // zeroes output result for formatting. number of zeros = outputStringLength - 2
+#define inputLength 8  // max digits = 6. add +1 for decimal. add +1 for null terminator '/0'
+#define outputLength 8
+#define zeros "0.00000"  // zeroes output result for formatting. number of zeros = outputLength - 2
 
 // INPUT
 char key;
-char currentValue[inputStringLength];
+char currentValue[inputLength];
 uint8_t currentValueIndex = 0;
 bool containsRadix = false;
 uint8_t sigFigs = 0;
 
 // OUTPUT
-char result_char[outputStringLength];
-float result_numeric;
+char result_char[outputLength];
+float result_float;
 
-void selectUnit() {                   // sets current conversion to appropriate index in activeUnits struct
+void setUnit() {                   // sets current conversion to appropriate index in activeUnits struct
   if (key == 'A') {
     currentUnit = 0;
   } else if (key == 'B') {
@@ -402,7 +436,6 @@ void setCurrentValue() {              // adds key to next index of currentValue 
   if (checkOverflow()) {
     currentValue[currentValueIndex] = key;
     currentValueIndex++;
-    //ncrementIndex();
     if (containsRadix && (key != '.')) {  // increments SigFigs if there is a radix, but not if the last key pressed was radix
       sigFigs++;
     }
@@ -410,20 +443,21 @@ void setCurrentValue() {              // adds key to next index of currentValue 
 }
 
 void resetCurrentValue() {            // resets current value and reinitializes formatting flags
-  memset(currentValue, '\0', inputStringLength);  //reset currentValue to null
+  memset(currentValue, '\0', inputLength);  //reset currentValue to null
   currentValueIndex = 0;
   containsRadix = false;
   sigFigs = 0;
+  serial_print_reset;
 }
 
 bool checkOverflow() {                // checks to see if a new number would overflow the currentValue string. if so, do not add the number
-                        // output TRUE if string length has not overflown
-                        // output FALSE  if string length has overflown (if string length has reached max string length)
+  // output TRUE if string length has not overflown
+  // output FALSE  if string length has overflown (if string length has reached max string length)
   uint8_t allowedDigits;
   if (containsRadix) {
-    allowedDigits = inputStringLength - 1;
+    allowedDigits = inputLength - 1;
   } else {
-    allowedDigits = inputStringLength - 2;
+    allowedDigits = inputLength - 2;
   }
 
   if (strlen(currentValue) == (allowedDigits)) {  // Detect full string
@@ -433,20 +467,28 @@ bool checkOverflow() {                // checks to see if a new number would ove
   }
 }
 
-void doMath() {                       // do multiply or do divide
-  if (conversionDirection[currentUnit]) {
-    result_numeric = atof(currentValue) * activeUnits[currentUnit].conversion;
+void doMath() {                       // do multiply/divide or do special function
+  
+  if (!activeUnits[currentUnit].special) {  // if special = 0
+
+    if (conversionDirection[currentUnit]) {
+      result_float = atof(currentValue) * activeUnits[currentUnit].conversion;
+    } else {
+      result_float = atof(currentValue) / activeUnits[currentUnit].conversion;
+    }
+
   } else {
-    result_numeric = atof(currentValue) / activeUnits[currentUnit].conversion;
+    specialFunctions(activeUnits[currentUnit].special);
   }
+
   resultChar();  // compute and format result
-  serialPrint();
+  serial_print;
 }
 
 void resultChar() {                   // do all output formatting of result
   //resultChar handles the output formatting -- taking in the output float and displaying a result max 6 digits long or scientific if necessary
 
-  long leadingDigits = (long)result_numeric;
+  long leadingDigits = (long)result_float;
   bool longFormat_Override = longFormat;  // there to override user selected short/long format. can remove if I dont want the option to choose
 
   // set 0.xxx = 1 leading digit and override to long format for precision
@@ -464,7 +506,7 @@ void resultChar() {                   // do all output formatting of result
 
   // determine output format; how many digits must be present at end of decimal -> depends on A: longFormat; B: number of sigfigs in input; C: number of leading digits in output
   uint8_t num_digits_after_decimal;
-  int8_t remaining_digits_allowed = outputStringLength - countDigits - 2;  // note that this value CAN go negative so cant be unsigned! subtract 2 for decimal and null terminator
+  int8_t remaining_digits_allowed = outputLength - countDigits - 2;  // note that this value CAN go negative so cant be unsigned! subtract 2 for decimal and null terminator
 
   if (longFormat || longFormat_Override) {  // long formatting logic
     num_digits_after_decimal = remaining_digits_allowed;
@@ -479,11 +521,10 @@ void resultChar() {                   // do all output formatting of result
   }
 
   // format output: either scientific notation, or decimal notation
-  if (countDigits > 6) {                                                 // do scientific notation  <-- consider improving this. currently output is only allowed 2 digits total.
-    dtostre(result_numeric, result_char, outputStringLength - 7, 0x04);  // subtract 7: 1: /0, 2: '.', 3: '+/-', 4: 1st exp digit, 5: 2nd exp digit, 6: leading single digit, 7: 'E'
-    //strcpy(result_char,"TOO BIG");
+  if (countDigits > outputLength - 2) {                                                 // do scientific notation  <-- consider improving this. currently output is only allowed 2 digits total.
+    dtostre(result_float, result_char, outputLength - 7, 0x04);  // subtract 7: 1: /0, 2: '.', 3: '+/-', 4: 1st exp digit, 5: 2nd exp digit, 6: leading single digit, 7: 'E'
   } else {  // do decimal notation
-    dtostrf(result_numeric, 1, num_digits_after_decimal, result_char);
+    dtostrf(result_float, 1, num_digits_after_decimal, result_char);
   }
 
   // format "0.00000" output to "0.0"
@@ -492,11 +533,33 @@ void resultChar() {                   // do all output formatting of result
   }
 
   // fill remainder of result_char with the space character, 32 :: {'3','.','1','2',\0,\0,\0,\0} ---> {'3','.','1','2',32,32,32,\0}
-  for (uint8_t j = strlen(result_char); j < outputStringLength - 1; j++) {  // this aids formatting since moving from strlen 7>6 wont delete old characters. this ensures all strlen are 7
+  for (uint8_t j = strlen(result_char); j < outputLength - 1; j++) {  // this aids formatting since moving from strlen 7>6 wont delete old characters. this ensures all strlen are 7
     result_char[j] = ' ';
   }
 }
 
+
+//------------------------------------------------------//
+//
+//               SPECIAL FUNCTIONS
+//
+//-----------------------------------------------------//
+
+void specialFunctions(uint8_t special){
+
+  debugln("SPECIAL FUNCTION USED");
+
+  switch (special){
+    case 4:           // diameter -> area
+      if (conversionDirection[currentUnit]){
+        result_float = (3.14159) * atof(currentValue) * atof(currentValue) / 4;
+      } else {
+        result_float = sqrt(4 * atof(currentValue) / 3.14159);
+      }
+      break;
+  }
+
+}
 
 //------------------------------------------------------//
 //
@@ -506,13 +569,17 @@ void resultChar() {                   // do all output formatting of result
 
 #define NUMBER_SIZE FONT_LARGE
 #define UNIT_SIZE FONT_STRETCHED
+#define BANNER_SIZE FONT_NORMAL
 #define SETTINGS_SIZE FONT_NORMAL
 #define numX 0
 #define numY 0
 #define unitX 60
 #define unitY 4
+#define bannerX1 0
+#define bannerX2 65
+#define bannerY 6
 #define clearUnits "    "       // {32,32,32,32,/0} 4 spaces char array :: reference unitStringLength
-#define clearNumbers "       "  // {32,32,32,32,32,32,32,/0} 7 spaces char array  :: reference inputStringLength & outputStringLength
+#define clearNumbers "       "  // {32,32,32,32,32,32,32,/0} 7 spaces char array  :: reference inputLength & outputLength
 
 void updateDisplayValues() {        // updates left and right displays with currentValue and result_char
 
@@ -554,71 +621,111 @@ void math_Displays() {              // clears displays and goes back to math rou
 void serialPrint() {                // print input, result, and units to serial monitor
 
   if (conversionDirection[currentUnit]) {  // true is multiply
-    Serial.print(currentValue);
-    Serial.print(" ");
-    Serial.print(activeUnits[currentUnit].unit1);
-    Serial.print("  --->   ");
-    Serial.print(result_char);
-    Serial.print(" ");
-    Serial.print(activeUnits[currentUnit].unit2);
-    Serial.print("  ");
-    Serial.println(result_numeric, 6);
+    view(currentValue);
+    view(" ");
+    view(activeUnits[currentUnit].unit1);
+    view("  --->   ");
+    view(result_char);
+    view(" ");
+    view(activeUnits[currentUnit].unit2);
+    view("  ");
+    viewF(result_float);
+    viewln();
   } else {
-    Serial.print(currentValue);
-    Serial.print(" ");
-    Serial.print(activeUnits[currentUnit].unit2);
-    Serial.print("  --->   ");
-    Serial.print(result_char);
-    Serial.print(" ");
-    Serial.print(activeUnits[currentUnit].unit1);
-    Serial.print("  ");
-    Serial.println(result_numeric, 6);
+    view(currentValue);
+    view(" ");
+    view(activeUnits[currentUnit].unit2);
+    view("  --->   ");
+    view(result_char);
+    view(" ");
+    view(activeUnits[currentUnit].unit1);
+    view("  ");
+    viewF(result_float);
+    viewln();
   }
 }
 
 void serialPrintReset() {           // indicate value has been reset
-  Serial.print(currentValue);
-  Serial.println("*");
+  view(currentValue);
+  viewln("*");
 }
 
-void drawSettingsMenu() {           // wrapper to draw all fields in settings menu
-  drawSleepSetting();
-  drawDimSetting();
-  drawFormatSelection();
-  drawButtonRow_Settings();
-  drawBatteryStatus();
+void draw_SettingsMenu() {           // wrapper to draw all fields in settings menu
+  clearDisplays();
+  draw_SleepSetting();
+  draw_DimSetting();
+  draw_FormatSelection();
+  draw_BatteryStatus();
+  drawBanner_settingsMenu();
 }
 
-void drawUnitsMenu() {              // wrapper to draw all fields in units menu
-
-  drawButtonRow_Units();
+void draw_UnitsMenu() {              // wrapper to draw all fields in units menu
+  clearDisplays();
+  drawBanner_unitsMenu();
 }
 
-void drawButtonRow_Settings() {     // draws input "banner" at bottom of screen for SETTINGS_MENU
-  oledWriteString(&dispL, 0, 0, 6, "SLEEP", SETTINGS_SIZE, 0, 1);
-  oledWriteString(&dispL, 0, 65, 6, "DIM", SETTINGS_SIZE, 0, 1);
-  oledWriteString(&dispR, 0, 0, 6, "FORMAT", SETTINGS_SIZE, 0, 1);
-  oledWriteString(&dispR, 0, 65, 6, "EXIT", SETTINGS_SIZE, 0, 1);
+void draw_Unit1(){
+  clearDisplays();
+  drawBanner_unit1();
 }
 
-void drawButtonRow_Units() {        // draws input "banner" at bottom of screen for UNITS_MENU
-  oledWriteString(&dispL, 0, 0, 6, "PREV", SETTINGS_SIZE, 0, 1);
-  oledWriteString(&dispL, 0, 65, 6, "NEXT", SETTINGS_SIZE, 0, 1);
-  oledWriteString(&dispR, 0, 0, 6, "CUSTOM", SETTINGS_SIZE, 0, 1);
-  oledWriteString(&dispR, 0, 65, 6, "EXIT", SETTINGS_SIZE, 0, 1);
+void draw_Unit2(){
+  clearDisplays();
+  drawBanner_unit2();
 }
 
-void drawSleepSetting() {           // draws currently selected sleep setting
+void draw_Convert(){
+  clearDisplays();
+  drawBanner_convert();
+}
+
+void drawBanner_settingsMenu() {     // draws input "banner" at bottom of screen for SETTINGS_MAIN
+  oledWriteString(&dispL, 0, bannerX1, bannerY, "SLEEP", BANNER_SIZE, 0, 1);
+  oledWriteString(&dispL, 0, bannerX2, bannerY, "DIM", BANNER_SIZE, 0, 1);
+  oledWriteString(&dispR, 0, bannerX1, bannerY, "FORMAT", BANNER_SIZE, 0, 1);
+  oledWriteString(&dispR, 0, bannerX2, bannerY, "EXIT", BANNER_SIZE, 0, 1);
+}
+
+void drawBanner_unitsMenu() {        // draws input "banner" at bottom of screen for UNITS_MAIN
+  oledWriteString(&dispL, 0, bannerX1, bannerY, "PREV", BANNER_SIZE, 0, 1);
+  oledWriteString(&dispL, 0, bannerX2, bannerY, "NEXT", BANNER_SIZE, 0, 1);
+  oledWriteString(&dispR, 0, bannerX1, bannerY, "CUSTOM", BANNER_SIZE, 0, 1);
+  oledWriteString(&dispR, 0, bannerX2, bannerY, "EXIT", BANNER_SIZE, 0, 1);
+}
+
+void drawBanner_unit1() {        // draws input "banner" at bottom of screen for UNITS_MAIN
+  oledWriteString(&dispL, 0, bannerX1, bannerY, "PREV", BANNER_SIZE, 0, 1);
+  oledWriteString(&dispL, 0, bannerX2, bannerY, "NEXT", BANNER_SIZE, 0, 1);
+  oledWriteString(&dispR, 0, bannerX1, bannerY, "ACCEPT", BANNER_SIZE, 0, 1);
+  oledWriteString(&dispR, 0, bannerX2, bannerY, "UNIT 2", BANNER_SIZE, 0, 1);
+}
+
+void drawBanner_unit2() {        // draws input "banner" at bottom of screen for UNITS_MAIN
+  oledWriteString(&dispL, 0, bannerX1, bannerY, "PREV", BANNER_SIZE, 0, 1);
+  oledWriteString(&dispL, 0, bannerX2, bannerY, "NEXT", BANNER_SIZE, 0, 1);
+  oledWriteString(&dispR, 0, bannerX1, bannerY, "ACCEPT", BANNER_SIZE, 0, 1);
+  oledWriteString(&dispR, 0, bannerX2, bannerY, "CONVERT", BANNER_SIZE, 0, 1);
+}
+
+void drawBanner_convert() {        // draws input "banner" at bottom of screen for UNITS_MAIN
+  // oledWriteString(&dispL, 0, bannerX1, bannerY, "PREV", BANNER_SIZE, 0, 1);
+  oledWriteString(&dispL, 0, bannerX2, bannerY, "CANCEL", BANNER_SIZE, 0, 1);
+  oledWriteString(&dispR, 0, bannerX1, bannerY, "FINISH", BANNER_SIZE, 0, 1);
+  oledWriteString(&dispR, 0, bannerX2, bannerY, "UNIT 1", BANNER_SIZE, 0, 1);
+
+}
+
+void draw_SleepSetting() {           // draws currently selected sleep setting
   #define xpos 0
   #define ypos 3
   oledWriteString(&dispL, 0, xpos, ypos, sleepTimer[sleepSetting].text, SETTINGS_SIZE, 0, 1);
 }
 
-void drawDimSetting() {            // draws currently selected dim setting
+void draw_DimSetting() {            // draws currently selected dim setting
   // empty
 }
 
-void drawFormatSelection() {       // draws currently selected short/long format setting
+void draw_FormatSelection() {       // draws currently selected short/long format setting
   if (longFormat) {
     oledWriteString(&dispR, 0, 0, 3, "LONG ", SETTINGS_SIZE, 0, 1);
   } else {
@@ -626,10 +733,69 @@ void drawFormatSelection() {       // draws currently selected short/long format
   }
 }
 
-void drawBatteryStatus() {         // draws current battery voltage/percentage in SETTINGS_MENU
+void draw_BatteryStatus() {         // draws current battery voltage/percentage in SETTINGS_MAIN
   // empty
 }
 
+//------------------------------------------------------//
+//
+//                    STATE FUNCTIONS
+//
+//------------------------------------------------------//
+
+bool stateChanged(){
+  if (STATE != LAST_STATE) {
+    return 1;
+  } else {
+    return 0;
+  }
+}
+
+void transitionTo(DEVICE_STATES TO){
+    switch (TO) {
+    case SETUP: break; // unused
+
+    case MATH:
+      viewln("MATH");
+      STATE = MATH;
+      math_Displays();
+      break;
+
+    case SETTINGS_MAIN:
+      viewln("SETTINGS");
+      STATE = SETTINGS_MAIN;
+      draw_SettingsMenu();
+      break;
+
+    //case SETTINGS_PWR: 
+      break;
+
+    //case SETTINGS_ADV: 
+      break;
+
+    case UNITS_MAIN:  
+      viewln("UNITS");
+      STATE = UNITS_MAIN;
+      draw_UnitsMenu(); 
+      break;
+
+    case UNITS_UNIT1: 
+      STATE = UNITS_UNIT1;
+      draw_Unit1(); 
+      break;
+
+    case UNITS_UNIT2:  
+      STATE = UNITS_UNIT2;
+      draw_Unit2(); 
+      break;
+
+    case UNITS_CONVERT:
+      STATE = UNITS_CONVERT;
+      draw_Convert(); 
+      break;
+  }
+
+}
 
 //------------------------------------------------------//
 //
@@ -640,99 +806,188 @@ void drawBatteryStatus() {         // draws current battery voltage/percentage i
 // Menu and Submenu ENUMS defined at top of file
 
 void enter_menus(KeypadEvent key) { // KeypadEvent handler for detecting long press - built in to keypad.h
-  if (tenKey.getState() == HOLD && DEVICE_MODE == MAIN) {
+  if (tenKey.getState() == HOLD && STATE == MATH) {
     switch (key) {
+
       case 'A': case 'B': case 'C': case 'D':
-        Serial.println("UNITS");
-        DEVICE_MODE = UNITS_MENU;
-        clearDisplays();
-        drawUnitsMenu();
+        transitionTo(UNITS_MAIN);
         break;
+
       case '.':
-        Serial.println("SETTINGS");
-        DEVICE_MODE = SETTINGS_MENU;
-        clearDisplays();
-        drawSettingsMenu();
+        transitionTo(SETTINGS_MAIN);
         break;
     }
   }
-  if (tenKey.getState() == HOLD && DEVICE_MODE == SETTINGS_MENU && key == 'D') {
-    sleep();
-  }
+  // if (tenKey.getState() == HOLD && STATE == SETTINGS_MAIN && key == 'D') {
+  //   sleep();
+  // }
 }
 
-void units_menu_selector() {        // puts you in the correct SUB_MENU
-  if (SUB_MENU == NONE) {
-    units_menu();
-  } else if (SUB_MENU == CUSTOM) {
-    custom_units_menu();
-  }
-}
-
-void settings_menu() {              // change settings in the SETTINGS_MENU, display results
+void settings_menu() {              // change settings in the SETTINGS_MAIN, display results
   switch (key) {
-    case 'A':  // SLEEP SETTINGS
-      Serial.println("SLEEP TIMER");
 
+    case 'A':  // SLEEP SETTINGS
+      viewln("SLEEP TIMER");
       sleepSetting++;
       if (sleepSetting > 5) { sleepSetting = 0; }
-      drawSleepSetting();
+      draw_SleepSetting();
       break;
+
     case 'B':  // DIM SETTINGS
-      Serial.println("DIM TIMER");
+      viewln("DIM TIMER");
       //empty
       break;
+
     case 'C':  // OUTPUT FORMAT SETTINGS
-      Serial.println("FORMAT");
-
+      viewln("FORMAT");
       longFormat = !longFormat;
-      drawFormatSelection();
+      draw_FormatSelection();
       break;
-    case 'D':  // EXIT TO MAIN MENU
-      Serial.println("EXIT");
 
-      DEVICE_MODE = MAIN;
-      math_Displays();
+    case 'D':  // EXIT TO MATH
+      viewln("EXIT");
+      transitionTo(MATH);
       break;
   }
 }
 
-void units_menu() {                 // change units in the UNITS_MENU, display results
+void units_menu() {                 // change units in the UNITS_MAIN, display results
 
   switch (key) {
     case 'A':  // INCREMENT DOWN STORED UNITS STRUCT
-      Serial.println("DECREMENT");
-
+      viewln("DECREMENT");
       // sleepSetting++;
       // if (sleepSetting > 5){sleepSetting = 0;}
-
       break;
+
     case 'B':  // INCREMENT UP STORED UNITS STRUCT
-      Serial.println("INCREMENT");
+      viewln("INCREMENT");
       //empty
       break;
-    case 'C':  // RUN INPUT CUSTOM UNITS SCRIPT
-      Serial.println("CUSTOM");
-      clearDisplays();
-      SUB_MENU = CUSTOM;
-      custom_units_menu();
-      break;
-    case 'D':  // EXIT TO MAIN MENU
-      Serial.println("EXIT");
 
-      SUB_MENU = NONE;
-      DEVICE_MODE = MAIN;
-      math_Displays();
+    case 'C':  // RUN INPUT CUSTOM UNITS SCRIPT
+      viewln("UNITS1");
+      transitionTo(UNITS_UNIT1);
+      // clearDisplays();
+      // STATE = UNITS_UNIT1;
+      // set_unit1();
+      break;
+
+    case 'D':  // EXIT TO MAIN MENU
+      viewln("EXIT");
+      transitionTo(MATH);
+      // STATE = MATH;
+      //math_Displays();
       break;
   }
 }
 
-void custom_units_menu() {          // change settings in the  CUSTOM_MENU, display results
-  Serial.println("ENTER CUSTOM UNITS MENU");
-  if (key == 'D') {
-    SUB_MENU = NONE;
-    DEVICE_MODE = MAIN;
-    math_Displays();
+void set_unit1() {                 // change units in UNITS_UNIT1, display results
+
+  switch (key) {
+    case 'A':  // INCREMENT DOWN STORED UNITS STRUCT
+      viewln("DOWN LETTER");
+      //empty
+      break;
+
+    case 'B':  // INCREMENT UP STORED UNITS STRUCT
+      viewln("UP LETTER");
+      //empty
+      break;
+
+    case 'C':  // RUN INPUT CUSTOM UNITS SCRIPT
+      viewln("NEXT INDEX");
+      //empty
+      break;
+      
+    case 'D':  // GO TO NEXT UNIT
+      viewln("UNITS2");
+      transitionTo(UNITS_UNIT2);
+      break;
+  }
+}
+
+void set_unit2() {                 // change units in UNITS_UNIT2, display results
+
+  switch (key) {
+    case 'A':  // INCREMENT DOWN STORED UNITS STRUCT
+      viewln("DOWN LETTER2");
+      //empty
+      break;
+
+    case 'B':  // INCREMENT UP STORED UNITS STRUCT
+      viewln("UP LETTER2");
+      //empty
+      break;
+
+    case 'C':  // RUN INPUT CUSTOM UNITS SCRIPT
+      viewln("NEXT INDEX2");
+      //empty
+      break;
+      
+    case 'D':  // GO TO CONVERSION INPUT
+      viewln("CONVERT");
+      transitionTo(UNITS_CONVERT);
+      break;
+  }
+}
+
+void set_convert() {                // change number in UNITS_CONVERT, display results
+
+  switch (key) {
+    case 'A': break; // unused 
+    case 'B':
+      viewln("CANCEL");
+      transitionTo(UNITS_MAIN);
+      break;
+    
+    case 'C':  // GO TO CONVERSION INPUT
+      viewln("EXIT");
+      transitionTo(MATH);
+      break;
+
+    case 'D':  // LOOP BACK TO UNIT1
+      viewln("BACK TO UNIT1");
+      transitionTo(UNITS_UNIT1);
+      break;
+  }
+}
+
+//------------------------------------------------------//
+//
+//               UNIT CONVERSION CODE
+//
+//-----------------------------------------------------//
+
+void UNIT_CONVERSION(){
+
+  //if(stateChanged()) { math_Displays(); }
+
+  switch (key) {
+    case 'd': case 'l': case 'u': break;  // SKIP UNUSED KEYS
+    case 'A': case 'B': case 'C': case 'D':
+      setUnit();
+      doMath();
+      updateDisplayUnits();
+      updateDisplayValues();
+      break;
+
+    case 'E':
+      updateDisplayResetValues();
+      resetCurrentValue();
+      break;
+
+    case 'S':
+      invertConversion();
+      doMath();
+      updateDisplayUnits();
+      updateDisplayValues();
+      break;
+
+    default:
+      setCurrentValue();
+      doMath();
+      updateDisplayValues();
   }
 }
 
@@ -747,7 +1002,7 @@ void custom_units_menu() {          // change settings in the  CUSTOM_MENU, disp
 
 void setup() {
 
-  Serial.begin(9600);
+  startSerial;
 
   // initialize Pin 2 for use as external interrupt
   pinMode(wakeUpPin, INPUT_PULLUP);
@@ -764,23 +1019,8 @@ void setup() {
   oledFill(&dispL, 0, 1);
   oledFill(&dispR, 0, 1);
 
-  // Forces wakeUp to run DEVICE_MODE code
-  DEVICE_MODE = SETUP;
-
-  // bool x = true;
-
-  // while(x){
-    
-  //     key = tenKey.getKey();
-
-  //     if(key){
-  //       Serial.print(key);
-  //     }
-
-  //     if(key == 'E'){
-  //     x=0;
-  //   }
- // }
+  // Forces wakeUp to run STATE code
+  STATE = SETUP;
 
   // do wakeUp
   wakeUp();
@@ -803,50 +1043,28 @@ void loop() {
   if (key) {
 
     idleTimer = millis();
-
-    switch (DEVICE_MODE) {
-
-      case SETTINGS_MENU:
-        settings_menu();
-        break;
-
-      case UNITS_MENU:
-        units_menu_selector();
-        break;
-
-      case MAIN:
-        switch (key) {
-
-          case 'd': case 'l': case 'u': break;  // SKIP UNUSED KEYS
-          case 'A': case 'B': case 'C': case 'D':
-            selectUnit();
-            doMath();
-            updateDisplayUnits();
-            updateDisplayValues();
-            break;
-
-          case 'E':
-            updateDisplayResetValues();  // do reset highlight format BEFORE currentValue is cleared
-            serialPrintReset();
-            resetCurrentValue();
-            break;
-
-          case 'S':
-            invertConversion();
-            doMath();
-            updateDisplayUnits();
-            updateDisplayValues();
-            break;
-
-          default:
-            setCurrentValue();
-            doMath();
-            updateDisplayValues();
-        }
-
-        break;
+    
+    
+    switch (STATE) {
+      case SETUP:           transitionTo(MATH);   break; // unused
+      case MATH:            UNIT_CONVERSION();    break;
+      case SETTINGS_MAIN:   settings_menu();      break;
+      //case SETTINGS_PWR:    power_menu();         break;
+      //case SETTINGS_ADV:    advanced_menu();      break;
+      case UNITS_MAIN:      units_menu();         break;
+      case UNITS_UNIT1:     set_unit1();          break;
+      case UNITS_UNIT2:     set_unit2();          break;
+      case UNITS_CONVERT:   set_convert();        break;
     }
+
+    // view("DID STATE JUST CHANGE???      ");
+    // viewln(stateChanged());
+    LAST_STATE = STATE;
+
   }
+
+  //Serial.print(LIST_HOLDER[10].unit1);
+
 
   // do Sleep?
   if (checkSleep() || checkLowBattery()) {
