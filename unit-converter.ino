@@ -26,12 +26,26 @@ variables are all camelCase
 /*
 // KNOWN ISSUES:: 
 
-checkForcePowerDown is bugged. crashes device on use (no keypad presses)
-checkForcePowerDown isnt fast enough. somehow next function in setup is still called. ideally FPD kills the device before displays turn on
-auto clear screen on power off in menu seems bulky. probably a better way to implement
 not sure if EWMA filter is weighted correctly
-make some way to choose which unit to overwrite? use a separate menu?
-drawFactoryReset text is weird
+code doesnt handle small numbers well. make some way for very small numbers to use scientific notation?
+code doesnt save all values when turning off yet! implement that soon
+
+sleep and reset work better now, but are contingent upon resetting the keypress state before sleep
+not sure if delay() in EEPROM function actually helps
+seems like UNITS_LIST length > 30 (50 tested) causes eeprom to fail. maybe causes dynamic memory usage to go too high?
+
+/*/
+
+/*
+// STUFF TO DO:: 
+
+slow down battery check time. currently checks too often
+fix small number handling. use scientific notation instead of printing 0?
+implement fractional input?
+do dec to frac conversion?
+consolodate serial.print fucntions
+move both displays to bit-bang i2c. easier to pinout on breadboard
+remove battery display from main screen?
 
 /*/
 
@@ -75,8 +89,8 @@ drawFactoryReset text is weird
 
 #if VIEW == 1 || DEBUG == 1
 #define startSerial Serial.begin(9600)
-#define serial_print serialPrint()
-#define serial_print_reset serialPrintReset()
+#define serial_print //serialPrint()
+#define serial_print_reset //serialPrintReset()
 #else
 #define startSerial
 #define serial_print
@@ -93,7 +107,7 @@ drawFactoryReset text is weird
 
 #define rows 5
 #define cols 4
-#define long_press_time 1000  // hold key for 2 seconds for long press to enter menus
+#define long_press_time 1000  // hold key for 1 seconds for long press to enter menus
 
 char keys[rows][cols] = {
   { 'D', 'C', 'B', 'A' },
@@ -128,7 +142,7 @@ Keypad tenKey = Keypad(makeKeymap(keys), pin_r, pin_c, rows, cols);
 #define invertDisplay_R 0   // dont invert the display
 #define USE_HW_I2C_R 0      // use bitbang'd software I2C
 
-#define displayResetPin -1  // -1 is no reset pin
+#define displayResetPin 0xC6  // -1 is no reset pin -- 0xC6 is pro mini RST pin
 
 // initialize display structs
 SSOLED dispL, dispR;
@@ -136,17 +150,19 @@ SSOLED dispL, dispR;
 ///////////////////////////// ENUMS /////////////////////////////
 
 enum DEVICE_STATES {
-  SETUP,
+  BEGIN,
   MAIN,
   SETTINGS_MAIN,
   SETTINGS_SYS,
   SETTINGS_RST,
   UNITS_MAIN,
+  UNITS_OVERWRITE,
   UNITS_UNIT1,
   UNITS_UNIT2,
   UNITS_CONVERT,
-  UNITS_OVERWRITE,
 } STATE;
+
+char key;
 
 //------------------------------------------------------//
 //
@@ -156,7 +172,10 @@ enum DEVICE_STATES {
 
 #define unitStringLength 5  // max characters = 4. add +1 for null terminator '/0'
 #define LIST_SIZE 30        // recommended values: 10-50. Max value: 60 before end of EEPROM
-#define end_default_units 7  // 7 <-- ref last index of DEFAULT_UNITS_LIST, ensures that default values arent overwritten
+
+bool factoryResetFlag = false;
+bool forceSleepFlag = false;
+
 
 // UNIT MATRIX
 struct UNITS_STRUCT {
@@ -200,12 +219,11 @@ UNITS_STRUCT activeUnits[4];
 #define EE_formatSelection 32  // 3 --> 32,33,34,-35-
 
 #define EE_UNITS_LIST 100  // 10min=150, 50max=750, each entry 15 bytes
+#define writeHoldTime 4
 
 void EEPROM_INIT() {
-  debugln("RESET CALLED!");
-  if (EEPROM[EE_INIT] == 255) {
 
-    debugln("EEPROM INIT!");
+  if (EEPROM[EE_INIT] == 255) {
 
     clearEEPROM();
 
@@ -218,7 +236,6 @@ void EEPROM_INIT() {
     uint8_t default_nextCustomIndex = 8; // 1+ num indexes in DEFAULT_UNITS_LIST
 
     UNITS_STRUCT DEFAULT_UNITS_LIST[LIST_SIZE] = {
-      // dont forget to add a 0 if the user doesnt add a .0 to the end. otherwise MAIN wont be float?  also, add leading spaces to units for formatting
       { "  in", "  mm", 0, 25.4 },     // 0   ---- 1 unit1 = 1 unit2 * conversion
       { "  yd", "  ft", 0, 3.0 },      // 1
       { "  kg", " lbf", 0, 2.2 },      // 2
@@ -230,25 +247,32 @@ void EEPROM_INIT() {
     };
 
     EEPROM.put(EE_currentUnit, default_currentUnit);
+    delay(writeHoldTime);
     EEPROM.put(EE_longFormat, default_longFormat);
+    delay(writeHoldTime);
     EEPROM.put(EE_sleepSetting, default_sleepSetting);
+    delay(writeHoldTime);
     EEPROM.put(EE_conversionDir, default_conversionDirection);
+    delay(writeHoldTime);
     EEPROM.put(EE_activeUnitsIdx, default_activeUnitsIndex);
+    delay(writeHoldTime);
     EEPROM.put(EE_nextCustIdx, default_nextCustomIndex);
+    delay(writeHoldTime);
     EEPROM.put(EE_UNITS_LIST, DEFAULT_UNITS_LIST);
+    delay(writeHoldTime);
 
     EEPROM[EE_INIT] = 69; // nice
 
-    //print_EEPROM;
   } else {
-    debugln("EEPROM UNTOUCHED");
+    viewln("EEPROM UNTOUCHED #2");
   }
 }
 
 void clearEEPROM() {
   for (uint16_t i = 0; i < EEPROM.length(); i++) {
-    //EEPROM[i] = 255;
+    // EEPROM[i] = 255;
     EEPROM.update(i, 255);  // less destructive while I test
+    delay(writeHoldTime);
   }
 }
 
@@ -315,10 +339,7 @@ void getSettings() {
   EEPROM.get(EE_conversionDir, conversionDirection);
   EEPROM.get(EE_activeUnitsIdx, activeUnitsIndex);
  
-
   getActiveUnits();
-
-  print_EEPROM;
 }
 
 void getActiveUnits() {
@@ -335,17 +356,24 @@ void getActiveUnits() {
   EEPROM.get(location3, activeUnits[3]);
 }
 
+bool checkFactoryReset() {
+  if (factoryResetFlag) {
+    factoryResetFlag = false;
+    factoryReset();
+    return 1;
+  } else {
+    return 0;
+  }
+}
+
 void factoryReset() {
-  resetCurrentValue();
+
   EEPROM[EE_INIT] = 255; // this resets the EEPROM INIT location and forces a factory reset
-  delay(10);
+  delay(200);
   EEPROM_INIT();
-  delay(300);
+  delay(200);
   getSettings();
-  delay(100);
-  viewln("EEPROM WILL INIT");
-  delay(3000);
-  sleep();
+  delay(300);
 }
 
 //------------------------------------------------------//
@@ -358,10 +386,10 @@ void factoryReset() {
 #define wakeUpPin_GND 12
 #define sleepSetting_Override 600000  // 10 mins
 
+volatile bool run_wakeUp;
+
 unsigned long idleTimer = millis();
 unsigned long battTimer = millis();
-
-volatile bool run_wakeUp;
 
 struct PWR_SETTINGS {
   unsigned long time;
@@ -369,9 +397,9 @@ struct PWR_SETTINGS {
 };
 
 PWR_SETTINGS sleepTimer[] = {
-  { 10000, "10 sec" },
-  { 30000, "30 sec" },
-  { 60000, " 1 min" },
+  { 10000,  "10 sec" },
+  { 30000,  "30 sec" },
+  { 60000,  " 1 min" },
   { 120000, " 2 min" },
   { 300000, " 5 min" },
   { 600000, "10 min" },
@@ -397,18 +425,33 @@ bool checkIdle() {  // checks to see if device has been idle too long. Menus ove
   }
 }
 
+bool checkForceSleep() {
+  if (forceSleepFlag) {
+    forceSleepFlag = false;
+    return 1;
+  } else {
+    return 0;
+  }
+}
+
 void sleep() {  // saves settings and puts the device to sleep
   // saves settings to EEPROM
   // puts the device to sleep
 
+
+  viewln("*****POWER DOWN******");
+  delay(1000);
+
   oledPower(&dispL, 0);
   oledPower(&dispR, 0);
 
+  // comment these out to save values on sleep
+  resetCurrentValue(); 
+  doMath();
+  draw_Values(); 
+  
   pinMode(wakeUpPin_GND, OUTPUT);
   digitalWrite(wakeUpPin_GND, LOW);
-
-  viewln("*****POWER DOWN******");
-  delay(100);
 
   attachInterrupt(digitalPinToInterrupt(wakeUpPin), wakeUp_ISR, LOW);
   LowPower.powerDown(SLEEP_FOREVER, ADC_OFF, BOD_OFF);
@@ -436,16 +479,28 @@ void wakeUp() {  // wake the device up, reset timers, initialize displays
 
   initVoltage();  // initBattVoltage?
 
-  oledPower(&dispL, 1);  // turn displays on
-  oledPower(&dispR, 1);
-
-
   // mayube theres a cleaner way to do this? power down could put the device in SETUP mode? which automatically triggers STATE=MAIN?
   // this is really only to catch first power on and accidental power off in menu (10 mins)
   if (STATE != MAIN) {  // clear display and start normal mode
     STATE = MAIN;
     draw_MAIN();
   }
+
+  oledPower(&dispL, 1);  // turn displays on
+  oledPower(&dispR, 1);
+}
+
+void resetKeyState() {
+  // for some reason, when sleep() is called, the keystate from keypad.h is not reset
+  // should figure out how to do this. but for now, here's a hack
+  // calls getKey 3 times. This forces the keystate to idle before the device goes to sleep 
+  // this is only needed for forcepowerdown or factoryreset  
+  delay(100);
+  key = tenKey.getKey(); // pressed
+  delay(100);
+  key = tenKey.getKey(); // released
+  delay(100);
+  key = tenKey.getKey(); // idle
 }
 
 //------------------------------------------------------//
@@ -506,14 +561,14 @@ bool checkLowBattery() {  // checks for low voltage or warning voltage
 
     getBatteryVoltage();
 
-    //draw_BatteryStatus();   // This will live-update the battery voltage in the settings menu. Uncomment to only load battery status once per entry
+    draw_BatteryStatus();   // This will live-update the battery voltage in the settings menu. Comment out to only load battery status once per entry
     draw_VoltageOnMain();   // Show voltage on MAIN state. Uncomment to enable
 
-    view("Volts:   ");
-    viewln(batteryVoltage);
+    //view("Volts:   ");
+    //viewln(batteryVoltage);
 
     if (batteryVoltage < shutdownVoltage) {
-      viewln("BATTERY LOW - POWER DOWN");
+      //viewln("BATTERY LOW - POWER DOWN");
       return 1;
     } else if (batteryVoltage < warningVoltage) {
       warningVoltageFlag = true;
@@ -537,10 +592,11 @@ bool checkLowBattery() {  // checks for low voltage or warning voltage
 #define zeros "0.00000"  // zeroes output result for formatting. number of zeros = outputLength - 2
 
 // INPUT
-char key;
+// char key;
 char currentValue[inputLength];
 uint8_t currentValueIndex = 0;
 bool containsRadix = false;
+bool secondRadixFlag = false;
 uint8_t sigFigs = 0;
 
 // OUTPUT
@@ -565,16 +621,35 @@ void invertConversion() {  // changes conversion direction for selected unit and
 
 void setCurrentValue() {  // adds key to next index of currentValue char array
 
-  if (key == '.' && containsRadix) { return; }  //return if theres already a radix present
-  if (key == '.') { containsRadix = true; }     //set contains radix. used to flag return and change checkOverflow length
+  if (key == '.' && containsRadix) { //return if theres already a radix present
+    secondRadixFlag = true;  
+    return; 
+  }  
 
   if (checkOverflow()) {
+    if (key == '.') { containsRadix = true; }     //set contains radix. used to flag return and change checkOverflow length
     currentValue[currentValueIndex] = key;
     currentValueIndex++;
     if (containsRadix && (key != '.')) {  // increments SigFigs if there is a radix, but not if the last key pressed was radix
       sigFigs++;
     }
   }
+}
+
+void undoRadixOnMenu() {  // bonus function to delete the unwanted radix that is created when you enter the menu using the '.' key
+
+  if (!checkOverflow()) { return; } // do nothing if input is at max length
+
+  if (secondRadixFlag) { // do nothing if input already has radix
+    secondRadixFlag = false;
+    return;
+  }
+
+  containsRadix = false;
+  currentValueIndex--;
+  currentValue[currentValueIndex] = '\0';
+
+  draw_Values();
 }
 
 void resetCurrentValue() {                  // resets current value and reinitializes formatting flags
@@ -772,7 +847,7 @@ void draw_MAIN() {  // clears displays and goes back to MAIN routine
 
 void draw_Values() {  // updates left and right displays with currentValue and result_char
 
-  if (currentValueIndex == 1) {
+  if (currentValueIndex == 1 || currentValueIndex == 0) {
     oledWriteString(&dispL, 0, numX, numY, clearNumbers, NUMBER_FONT, 0, 1);
   }
 
@@ -802,43 +877,58 @@ void draw_SettingsMenu() {  // wrapper to draw all fields in settings menu
   draw_SleepSetting();
   draw_FormatSelection();
   draw_BatteryStatus(); // empty
-  drawBanner_settingsMenu();
+  drawBanner("SLEEP", "FORMAT", "SYSTEM", "SAVE");
 }
 
 void draw_SystemSettings() {
   clearDisplays();
   draw_BatteryStatus();
-  drawBanner_systemSettings();
+  //drawBanner_systemSettings();
+  oledWriteString(&dispL, 0, bannerX1, bannerY-1, "POWER", BANNER_FONT, 0, 1);
+  oledWriteString(&dispR, 0, bannerX1, bannerY-1, "FACTORY", BANNER_FONT, 0, 1);
+  drawBanner("DOWN", "   ", "RESET", "BACK");
 }
 
 void draw_UnitsMenu() {  // wrapper to draw all fields in units menu
   clearDisplays();
   draw_SelectedUnit();
-  drawBanner_unitsMenu();
+  drawBanner("PREV", "NEXT", "NEW", "SAVE");
+}
+
+void draw_UnitsOverwrite(){
+  clearDisplays();
+  oledWriteString(&dispL, 0, numX, 2, "ARE YOU SURE?", BANNER_FONT, 0, 1);
+  oledWriteString(&dispR, 0, numX, 1, "This will overwrite", SMALL_FONT, 0, 1);
+  oledWriteString(&dispR, 0, numX, 2, "the currently", SMALL_FONT, 0, 1);               //////////////// this line is weird
+  oledWriteString(&dispR, 0, numX, 3, "selected unit", SMALL_FONT, 0, 1);
+  drawBanner("YES", "   ", "   ","NO");
 }
 
 // SUB MENUS ------------------------------
 
 void draw_Unit1() {
   clearDisplays();
-  drawBanner_unit1();
+  drawBanner("UP","DOWN","NEXT","UNIT 2");
   draw_UserUnit1();
-  draw_UserUnitIndicator();
-  oledWriteString(&dispL, 0, 0, 1, "UNIT 1:", SMALL_FONT, 0, 1);
+  draw_UserUnit2();
+  draw_UserUnitIndicator(1);
+  oledWriteString(&dispL, 0, 0, 0, "UNIT 1:", SMALL_FONT, 0, 1);
+  oledWriteString(&dispR, 0, 0, 0, "UNIT 2:", SMALL_FONT, 0, 1);
 
 }
 
 void draw_Unit2() {
-  clearDisplays();
-  drawBanner_unit2();
-  draw_UserUnit2();
-  draw_UserUnitIndicator();
-  oledWriteString(&dispL, 0, 0, 1, "UNIT 2:", SMALL_FONT, 0, 1);
+  oledWriteString(&dispL, 0, 0, bannerY, clearRow, BANNER_FONT, 0, 1);
+  oledWriteString(&dispR, 0, 0, bannerY, clearRow, BANNER_FONT, 0, 1);
+  drawBanner("UP","DOWN","NEXT","CONVERT");
+  draw_UserUnitIndicator(0);
 }
 
 void draw_Convert() {
   clearDisplays();
-  drawBanner_convert();
+  drawBanner("SAVE", "EXIT", "UNDO", "UNIT 1");
+  draw_UserConvertInfo();
+  draw_UserConvertValue();
 }
 
 void draw_FactoryReset() {  //////////////// this text is werid
@@ -848,58 +938,16 @@ void draw_FactoryReset() {  //////////////// this text is werid
   oledWriteString(&dispR, 0, numX, 2, "settings and wll", SMALL_FONT, 0, 1);               //////////////// this line is weird
   oledWriteString(&dispR, 0, numX, 3, "clear all custom", SMALL_FONT, 0, 1);
   oledWriteString(&dispR, 0, numX, 4, "units", SMALL_FONT, 0, 1);
-  drawBanner_factoryReset();
+  drawBanner("YES", "   ", "   ","NO");
 }
 
 // BANNERS ------------------------------
 
-void drawBanner_settingsMenu() {  // draws input "banner" at bottom of screen for SETTINGS_MAIN
-  oledWriteString(&dispL, 0, bannerX1, bannerY, "SLEEP", BANNER_FONT, 0, 1);
-  oledWriteString(&dispL, 0, bannerX2, bannerY, "FORMAT", BANNER_FONT, 0, 1);
-  oledWriteString(&dispR, 0, bannerX1, bannerY, "SYSTEM", BANNER_FONT, 0, 1);
-  oledWriteString(&dispR, 0, bannerX2, bannerY, "SAVE", BANNER_FONT, 0, 1);
-}
-
-void drawBanner_systemSettings() {
-  oledWriteString(&dispL, 0, bannerX1, bannerY-1, "POWER", BANNER_FONT, 0, 1);
-  oledWriteString(&dispL, 0, bannerX1, bannerY, "DOWN", BANNER_FONT, 0, 1);
-  //oledWriteString(&dispL, 0, bannerX2, bannerY, "BATTERY", BANNER_FONT, 0, 1);
-  oledWriteString(&dispR, 0, bannerX1, bannerY-1, "FACTORY", BANNER_FONT, 0, 1);
-  oledWriteString(&dispR, 0, bannerX1, bannerY, "RESET", BANNER_FONT, 0, 1);
-  oledWriteString(&dispR, 0, bannerX2, bannerY, "BACK", BANNER_FONT, 0, 1);
-}
-
-void drawBanner_unitsMenu() {  // draws input "banner" at bottom of screen for UNITS_MAIN
-  oledWriteString(&dispL, 0, bannerX1, bannerY, "PREV", BANNER_FONT, 0, 1);
-  oledWriteString(&dispL, 0, bannerX2, bannerY, "NEXT", BANNER_FONT, 0, 1);
-  oledWriteString(&dispR, 0, bannerX1, bannerY, "CUSTOM", BANNER_FONT, 0, 1);
-  oledWriteString(&dispR, 0, bannerX2, bannerY, "SAVE", BANNER_FONT, 0, 1);
-}
-
-void drawBanner_unit1() {  // draws input "banner" at bottom of screen for UNITS_MAIN
-  oledWriteString(&dispL, 0, bannerX1, bannerY, "PREV", BANNER_FONT, 0, 1);
-  oledWriteString(&dispL, 0, bannerX2, bannerY, "NEXT", BANNER_FONT, 0, 1);
-  oledWriteString(&dispR, 0, bannerX1, bannerY, "ACCEPT", BANNER_FONT, 0, 1);
-  oledWriteString(&dispR, 0, bannerX2, bannerY, "UNIT 2", BANNER_FONT, 0, 1);
-}
-
-void drawBanner_unit2() {  // draws input "banner" at bottom of screen for UNITS_MAIN
-  oledWriteString(&dispL, 0, bannerX1, bannerY, "PREV", BANNER_FONT, 0, 1);
-  oledWriteString(&dispL, 0, bannerX2, bannerY, "NEXT", BANNER_FONT, 0, 1);
-  oledWriteString(&dispR, 0, bannerX1, bannerY, "ACCEPT", BANNER_FONT, 0, 1);
-  oledWriteString(&dispR, 0, bannerX2, bannerY, "CONVERT", BANNER_FONT, 0, 1);
-}
-
-void drawBanner_convert() {  // draws input "banner" at bottom of screen for UNITS_MAIN
-  // oledWriteString(&dispL, 0, bannerX1, bannerY, "PREV", BANNER_FONT, 0, 1);
-  oledWriteString(&dispL, 0, bannerX2, bannerY, "CANCEL", BANNER_FONT, 0, 1);
-  oledWriteString(&dispR, 0, bannerX1, bannerY, "SAVE", BANNER_FONT, 0, 1);
-  oledWriteString(&dispR, 0, bannerX2, bannerY, "UNIT 1", BANNER_FONT, 0, 1);
-}
-
-void drawBanner_factoryReset() {
-  oledWriteString(&dispL, 0, bannerX1, 6, "YES", UNIT_FONT, 0, 1);
-  oledWriteString(&dispR, 0, bannerX2, 6, "NO", UNIT_FONT, 0, 1);
+void drawBanner(char a[], char b[], char c[], char d[]) {
+  oledWriteString(&dispL, 0, bannerX1, bannerY, a, BANNER_FONT, 0, 1);
+  oledWriteString(&dispL, 0, bannerX2, bannerY, b, BANNER_FONT, 0, 1);
+  oledWriteString(&dispR, 0, bannerX1, bannerY, c, BANNER_FONT, 0, 1);
+  oledWriteString(&dispR, 0, bannerX2, bannerY, d, BANNER_FONT, 0, 1);
 }
 
 // INDIVIDUAL SETTINGS ------------------------------
@@ -922,18 +970,24 @@ void draw_SelectedUnit() {
 
   EEPROM.get(location, activeUnits[currentUnit]);
 
-  viewln(activeUnits[currentUnit].unit1);
-  viewln(activeUnits[currentUnit].unit2);
+  // viewln(activeUnits[currentUnit].unit1);
+  // viewln(activeUnits[currentUnit].unit2);
 
-  oledWriteString(&dispL, 0, numX+20, numY, activeUnits[currentUnit].unit1, NUMBER_FONT, 0, 1);
-  oledWriteString(&dispR, 0, numX+20, numY, activeUnits[currentUnit].unit2, NUMBER_FONT, 0, 1);
+  if (activeUnitsIndex[currentUnit] != nextCustomIndex) {
+    oledWriteString(&dispL, 0, numX+20, numY, activeUnits[currentUnit].unit1, NUMBER_FONT, 0, 1);
+    oledWriteString(&dispR, 0, numX+20, numY, activeUnits[currentUnit].unit2, NUMBER_FONT, 0, 1);
+  } else {
+    oledWriteString(&dispL, 0, numX+20, numY, "NEW ", NUMBER_FONT, 0, 1);
+    oledWriteString(&dispR, 0, numX+20, numY, "UNIT", NUMBER_FONT, 0, 1);
+  }
 
   char buffer[4];
   
   oledWriteString(&dispL, 0, 0, 4, clearRow, SETTINGS_FONT, 0, 1);
-  oledWriteString(&dispL, 0, 30, 4, itoa((int)activeUnitsIndex[currentUnit], buffer, 10), SETTINGS_FONT, 0, 1);
+  oledWriteString(&dispL, 0, 30, 4, itoa(activeUnitsIndex[currentUnit]+1, buffer, 10), SETTINGS_FONT, 0, 1);
   oledWriteString(&dispL, 0, 30+20, 4, "/", SETTINGS_FONT, 0, 1);
-  oledWriteString(&dispL, 0, 30+33, 4, itoa((int)nextCustomIndex-1, buffer, 10), SETTINGS_FONT, 0, 1);
+  //oledWriteString(&dispL, 0, 30+33, 4, itoa(nextCustomIndex+1, buffer, 10), SETTINGS_FONT, 0, 1);
+  oledWriteString(&dispL, 0, 30+33, 4, itoa(LIST_SIZE, buffer, 10), SETTINGS_FONT, 0, 1);
 
 }
 
@@ -989,31 +1043,110 @@ void draw_BatteryStatus() {  // draws current battery voltage/percentage in SETT
 //             USER CUSTOM UNITS FUNCTIONS
 //
 //------------------------------------------------------//
-char usr_letter = 'a'; // 97
-char usr_unit1[unitStringLength] = "a";
-char usr_unit2[unitStringLength] = "a";
-char usr_conversion[outputLength];
-
+char usr_letter = 96; // 96 --> 97 = 'a'
+char usr_unit1[unitStringLength];
+char usr_unit2[unitStringLength];
+int8_t saveIndex;
+//char usr_conversion[outputLength];
 uint8_t usr_index = 0;
 
+void initCustomUnits() {
+  strcpy(usr_unit1, clearUnits);
+  strcpy(usr_unit2, clearUnits);
+  resetCurrentValue();
+}
+
+void selectUnit(bool direction) {
+  // 0 is decrement
+  // 1 is increment
+
+  // increment or decrement
+  if (direction) {
+    activeUnitsIndex[currentUnit]++;
+  } else {
+    activeUnitsIndex[currentUnit]--;
+  }
+
+  // loop around available units
+  if (activeUnitsIndex[currentUnit] > nextCustomIndex) {
+    activeUnitsIndex[currentUnit] = 0;
+  } else if (activeUnitsIndex[currentUnit] < 0) {
+    activeUnitsIndex[currentUnit] = nextCustomIndex;
+  }
+
+  //viewln(activeUnitsIndex[currentUnit]);
+
+}
+
+void saveNewUnit() {
+
+  // if (atof(currentValue) == 0) { // cancel if user conversion is zero. Zero will break the code (divide by zero)
+  //   activeUnitsIndex[currentUnit] = saveIndex;
+  //   return;
+  // }
+
+  UNITS_STRUCT NEW_UNIT;
+  strcpy(NEW_UNIT.unit1, usr_unit1);
+  strcpy(NEW_UNIT.unit2, usr_unit2);
+  NEW_UNIT.special = 0;
+  NEW_UNIT.conversion = atof(currentValue);
+
+  // replace activeUnits with new unit
+  activeUnits[currentUnit] = NEW_UNIT;
+  conversionDirection[currentUnit] = 1; // set conversion direction to match default
+
+  if (activeUnitsIndex[currentUnit] == nextCustomIndex){ // increment ONLY if changed unit is at end of list
+    nextCustomIndex++;
+    if (nextCustomIndex > LIST_SIZE) {
+      nextCustomIndex = LIST_SIZE;
+    }
+  }
+
+  EEPROM.put(EE_nextCustIdx, nextCustomIndex);
+  EEPROM.put(EE_activeUnitsIdx, activeUnitsIndex);
+
+  unsigned int location = EE_UNITS_LIST + ( sizeof(activeUnits[0]) * activeUnitsIndex[currentUnit] );
+  EEPROM.put(location, NEW_UNIT);
+
+}
 
 
 // USER DEFINED UNITS DISPLAYS ------------------------------
 
 void draw_UserUnit1() {
-  oledWriteString(&dispL, 0, 40, 2, usr_unit1, UNIT_FONT, 0, 1);
+  oledWriteString(&dispL, 0, 45, 2, usr_unit1, UNIT_FONT, 0, 1);
 }
 
 void draw_UserUnit2() {
-  oledWriteString(&dispR, 0, 40, 2, usr_unit1, UNIT_FONT, 0, 1);
+  oledWriteString(&dispR, 0, 45, 2, usr_unit2, UNIT_FONT, 0, 1);
 }
 
-void draw_UserUnitIndicator() {
+void draw_UserUnitIndicator(bool side) {
 
-  unsigned int xloc = 45 + (16 * usr_index);
+  unsigned int xloc = 45+5 + (16 * usr_index);
   char indicator[] = "^";
-  oledWriteString(&dispL, 0, 0, 2+3, clearRow, SMALL_FONT, 0, 1);
-  oledWriteString(&dispL, 0, xloc, 2+3, indicator, SMALL_FONT, 0, 1);
+
+  oledWriteString(&dispL, 0, 0, 2+2, clearRow, BANNER_FONT, 0, 1);
+  oledWriteString(&dispR, 0, 0, 2+2, clearRow, BANNER_FONT, 0, 1);
+
+  if (side) {
+  oledWriteString(&dispL, 0, xloc, 2+2, indicator, BANNER_FONT, 0, 1);
+  } else {
+  oledWriteString(&dispR, 0, xloc, 2+2, indicator, BANNER_FONT, 0, 1);
+  }
+}
+
+void draw_UserConvertInfo() {
+  oledWriteString(&dispL, 0, numX, numY, "1.0", NUMBER_FONT, 0, 1);
+  oledWriteString(&dispL, 0, unitX, unitY, usr_unit1, UNIT_FONT, 0, 1);
+  oledWriteString(&dispR, 0, unitX, unitY, usr_unit2, UNIT_FONT, 0, 1);
+}
+
+void draw_UserConvertValue() {
+  if (currentValueIndex == 1) {
+    oledWriteString(&dispR, 0, numX, numY, clearNumbers, NUMBER_FONT, 0, 1);
+  }
+  oledWriteString(&dispR, 0, numX, numY, currentValue, NUMBER_FONT, 0, 1);
 }
 
 
@@ -1026,56 +1159,61 @@ void draw_UserUnitIndicator() {
 
 void transitionTo(DEVICE_STATES TO) {
   switch (TO) {
-    case SETUP: break;  // unused
+    case BEGIN: break;  // unused
 
     case MAIN:
-      viewln("MAIN");
+      // viewln("MAIN");
       STATE = MAIN;
       draw_MAIN();
       break;
 
     case SETTINGS_MAIN:
-      viewln("SETTINGS");
+      // viewln("SETTINGS");
       STATE = SETTINGS_MAIN;
       draw_SettingsMenu();
       break;
 
     case SETTINGS_SYS:
-      viewln("SYSTEM");
+      // viewln("SYSTEM");
       STATE = SETTINGS_SYS;
       draw_SystemSettings();
       break;
 
     case SETTINGS_RST:
-      viewln("FACTORY RESET");
+      // viewln("FACTORY RESET");
       STATE = SETTINGS_RST;
       draw_FactoryReset();
       break;
 
     case UNITS_MAIN:
-      viewln("UNITS");
+      // viewln("UNITS - CALLED");
       STATE = UNITS_MAIN;
       EEPROM.get(EE_nextCustIdx, nextCustomIndex);
       draw_UnitsMenu();
       break;
+    
+    case UNITS_OVERWRITE:
+      // viewln("NEW");
+      STATE = UNITS_OVERWRITE;
+      draw_UnitsOverwrite();
+      break;
 
     case UNITS_UNIT1:
       STATE = UNITS_UNIT1;
-      usr_letter = 'a';
+      usr_letter = 96;
       usr_index = 0;
       draw_Unit1();
       break;
 
     case UNITS_UNIT2:
       STATE = UNITS_UNIT2;
-      usr_letter = 'a';
+      usr_letter = 96;
       usr_index = 0;
       draw_Unit2();
       break;
 
     case UNITS_CONVERT:
       STATE = UNITS_CONVERT;
-      usr_index = 0;
       draw_Convert();
       break;
   }
@@ -1090,14 +1228,18 @@ void transitionTo(DEVICE_STATES TO) {
 // Menu and Submenu ENUMS defined at top of file
 
 void enter_menus(KeypadEvent key) {  // KeypadEvent handler for detecting long press - built in to keypad.h
+
+  // viewln("EVENT HANDLER CALLED");
+  // viewln(tenKey.getState());
+
   if (tenKey.getState() == HOLD && STATE == MAIN) {
     switch (key) {
-
       case 'A': case 'B': case 'C': case 'D':
         transitionTo(UNITS_MAIN);
         break;
 
       case '.':
+        undoRadixOnMenu();
         transitionTo(SETTINGS_MAIN);
         break;
     }
@@ -1108,25 +1250,25 @@ void settings_menu() {  // change settings in the SETTINGS_MAIN, display results
   switch (key) {
 
     case 'A':  // SLEEP SETTINGS
-      viewln("SLEEP TIMER");
+      //viewln("SLEEP TIMER");
       sleepSetting++;
       if (sleepSetting > 5) { sleepSetting = 0; }
       draw_SleepSetting();
       break;
 
     case 'B':  // NUMBER FORMAT SETTING
-      viewln("FORMAT");
+      //viewln("FORMAT");
       longFormat = !longFormat;
       draw_FormatSelection();
       break;
 
     case 'C':  // SYSTEM SETTINGS
-      viewln("SYSTEM");
+      //viewln("SYSTEM");
       transitionTo(SETTINGS_SYS);
       break;
 
     case 'D':  // EXIT TO MAIN
-      viewln("EXIT");
+      //viewln("EXIT");
       saveSettings();
       transitionTo(MAIN);
       break;
@@ -1137,8 +1279,8 @@ void system_menu() {
   switch (key) {
 
     case 'A':  // POWER OFF
-      viewln("POWER OFF");
-      sleep();
+      forceSleepFlag = true;
+      //sleep();
       break;
 
     case 'B':  // unused for now
@@ -1148,30 +1290,31 @@ void system_menu() {
       break;
 
     case 'C':  // FACTORY RESET
-      viewln("FACTORY RESET");
+      
       transitionTo(SETTINGS_RST);
       break;
 
     case 'D':  // BACK TO SETTINGS
-      viewln("BACK");
+      
       transitionTo(SETTINGS_MAIN);
       break;
   }
 }
 
-void reset_menu() {
+void fact_reset_menu() {
   switch (key) {
 
     case 'A':  // YES
-      viewln("YES");
+      // viewln("YES");
       draw_ResetConfirm();
-      factoryReset();
+      factoryResetFlag = true;
+      // factoryReset();
       break;
 
     case 'B': case 'C': break; // unused
 
     case 'D':  // NO
-      viewln("NO");
+      // viewln("NO");
       transitionTo(SETTINGS_SYS);
       break;
   }
@@ -1181,49 +1324,62 @@ void units_menu() {  // change units in the UNITS_MAIN, display results
 
   switch (key) {
     case 'A':  // INCREMENT DOWN STORED UNITS STRUCT
-      viewln("DECREMENT");
+      // viewln("DECREMENT");
 
-      activeUnitsIndex[currentUnit]--;
-
-      if (activeUnitsIndex[currentUnit] <= 0) {
-        activeUnitsIndex[currentUnit] = nextCustomIndex - 1;
-        // activeUnitsIndex[currentUnit] = 50;
-      }
-      viewln(activeUnitsIndex[currentUnit]);
-
+      selectUnit(0);
       draw_SelectedUnit();
-
       break;
 
     case 'B':  // INCREMENT UP STORED UNITS STRUCT
-      viewln("INCREMENT");
+      // viewln("INCREMENT");
 
-      activeUnitsIndex[currentUnit]++;
-
-      if (activeUnitsIndex[currentUnit] >= nextCustomIndex) {
-        activeUnitsIndex[currentUnit] = 0;
-      }
-      viewln(activeUnitsIndex[currentUnit]);
-
+      selectUnit(1); 
       draw_SelectedUnit();
-
       break;
 
     case 'C':  // RUN INPUT CUSTOM UNITS SCRIPT
-      viewln("UNITS1");
-      transitionTo(UNITS_UNIT1);
-      // clearDisplays();
-      // STATE = UNITS_UNIT1;
-      // set_unit1();
+      // viewln("NEW");
+
+      saveIndex = activeUnitsIndex[currentUnit];
+
+      if (activeUnitsIndex[currentUnit] == nextCustomIndex) {
+        initCustomUnits();
+        transitionTo(UNITS_UNIT1);
+      } else {
+        transitionTo(UNITS_OVERWRITE);
+      }
+
       break;
 
     case 'D':  // EXIT TO MAIN MENU
-      viewln("EXIT");
+      // viewln("SAVE");
+
+      if (activeUnitsIndex[currentUnit] == nextCustomIndex) {
+        break; // dont do anything if user hasnt selected valid unit
+      }
 
       conversionDirection[currentUnit] = 1; // set conversion direction to match default
       EEPROM.put(EE_activeUnitsIdx, activeUnitsIndex);
 
       transitionTo(MAIN);
+      break;
+  }
+}
+
+void confirm_overwrite() { 
+  switch (key) {
+
+    case 'A':  // YES
+      // viewln("YES");
+      initCustomUnits();
+      transitionTo(UNITS_UNIT1);
+      break;
+
+    case 'B': case 'C': break; // unused
+
+    case 'D':  // NO
+      // viewln("NO");
+      transitionTo(UNITS_MAIN);
       break;
   }
 }
@@ -1251,7 +1407,7 @@ void set_unit1() {  // change units in UNITS_UNIT1, display results
       break;
 
     case 'B':  // INCREMENT UP STORED UNITS STRUCT
-      viewln("UP LETTER");
+      // viewln("UP LETTER");
       
       usr_letter++;
       if (usr_letter > 126) { usr_letter = 32; }
@@ -1269,20 +1425,20 @@ void set_unit1() {  // change units in UNITS_UNIT1, display results
       break;
 
     case 'C':  // RUN INPUT CUSTOM UNITS SCRIPT
-      viewln("NEXT INDEX");
+      // viewln("NEXT INDEX");
       
-      usr_letter = 'a';
+      usr_letter = 96;
       usr_index++;
       Serial.println(usr_index);
       if (usr_index > 3){
         usr_index = 0;
       }
-      draw_UserUnitIndicator();
+      draw_UserUnitIndicator(1);
 
       break;
 
     case 'D':  // GO TO NEXT UNIT
-      viewln("UNITS2");
+      // viewln("UNITS2");
       transitionTo(UNITS_UNIT2);
       break;
   }
@@ -1292,7 +1448,7 @@ void set_unit2() {  // change units in UNITS_UNIT2, display results
 
   switch (key) {
     case 'A':  // INCREMENT DOWN STORED UNITS STRUCT
-      viewln("DOWN LETTER2");
+      // viewln("DOWN LETTER2");
 
       usr_letter--;
       if (usr_letter < 32) { usr_letter = 126; }
@@ -1308,7 +1464,7 @@ void set_unit2() {  // change units in UNITS_UNIT2, display results
       break;
 
     case 'B':  // INCREMENT UP STORED UNITS STRUCT
-      viewln("UP LETTER2");
+      // viewln("UP LETTER2");
 
       usr_letter++;
       if (usr_letter > 126) { usr_letter = 32; }
@@ -1324,19 +1480,19 @@ void set_unit2() {  // change units in UNITS_UNIT2, display results
       break;
 
     case 'C':  // RUN INPUT CUSTOM UNITS SCRIPT
-      viewln("NEXT INDEX2");
-      usr_letter = 'a';
+      // viewln("NEXT INDEX2");
+      usr_letter = 96;
       usr_index++;
       Serial.println(usr_index);
       if (usr_index > 3){
         usr_index = 0;
       }
+      draw_UserUnitIndicator(0);
       break;
 
     case 'D':  // GO TO CONVERSION INPUT
-      viewln("CONVERT");
+      // viewln("CONVERT");
       transitionTo(UNITS_CONVERT);
-      draw_UserUnitIndicator();
       break;
   }
 }
@@ -1344,21 +1500,40 @@ void set_unit2() {  // change units in UNITS_UNIT2, display results
 void set_convert() {  // change number in UNITS_CONVERT, display results
 
   switch (key) {
-    case 'A': break;  // unused
+    case 'A': 
+      viewln("SAVE");
+
+      if (atof(currentValue) == 0) { // cancel if user conversion is zero. Zero will break the code (divide by zero)
+        break;
+      }
+
+      saveNewUnit();
+      resetCurrentValue();
+      transitionTo(MAIN);     // dont forget to handle all zeros input!!!!!
+      break;  
     case 'B':
       viewln("CANCEL");
       transitionTo(UNITS_MAIN);
+      resetCurrentValue();
       break;
 
     case 'C':  // GO TO CONVERSION INPUT
-      viewln("SAVE");
-      transitionTo(MAIN);
+      viewln("DELETE");
+      resetCurrentValue();
+      oledWriteString(&dispR, 0, numX, numY, clearNumbers, NUMBER_FONT, 0, 1);
       break;
 
     case 'D':  // LOOP BACK TO UNIT1
       viewln("BACK TO UNIT1");
       transitionTo(UNITS_UNIT1);
       break;
+
+    case 'd': case 'l': case 'u': break;  // SKIP UNUSED KEYS
+    case 'E': case 'S': break;  // not used
+
+    default:
+      setCurrentValue();
+      draw_UserConvertValue();
   }
 }
 
@@ -1409,7 +1584,7 @@ void UNIT_CONVERSION() {
 
 void setup() {
 
-  STATE = SETUP;
+  STATE = BEGIN;
 
   startSerial;
   Serial.begin(9600);
@@ -1439,10 +1614,20 @@ void setup() {
   oledFill(&dispL, 0, 1);
   oledFill(&dispR, 0, 1);
 
+  // if (STATE == SETUP) {
+  //   viewln("**************SETUP COMPLETE*****************");  
+  // //   STATE = MAIN; 
+  // // } else {
+  // //   viewln("change to main");
+  // //   viewln(STATE);
+  // //   STATE = MAIN;
+  // }
+
   // do wakeUp
   wakeUp();
 
 }
+
 
 //------------------------------------------------------//
 //
@@ -1456,30 +1641,30 @@ void loop() {
   // do wakeUp?
   if (run_wakeUp) { wakeUp(); }
 
-  key = tenKey.getKey();
+  key = tenKey.getKey(); 
 
   if (key) {
 
     idleTimer = millis();
-
+    
     switch (STATE) {
-      case SETUP:           transitionTo(MAIN);   break;
+      case BEGIN:           transitionTo(MAIN);   break;
       case MAIN:            UNIT_CONVERSION();    break;
       case SETTINGS_MAIN:   settings_menu();      break;
       case SETTINGS_SYS:    system_menu();        break;
-      case SETTINGS_RST:    reset_menu();         break;
+      case SETTINGS_RST:    fact_reset_menu();    break;
       case UNITS_MAIN:      units_menu();         break;
+      case UNITS_OVERWRITE: confirm_overwrite();  break;
       case UNITS_UNIT1:     set_unit1();          break;
       case UNITS_UNIT2:     set_unit2();          break;
       case UNITS_CONVERT:   set_convert();        break;
-      //case UNITS_OVERWRITE: set_overwrite();      break;
     }
 
   }
 
   // do Sleep?
-  if (checkIdle() || checkLowBattery()) {
-    delay(500);  // not so fast
+  if (checkIdle() || checkLowBattery() || checkForceSleep() || checkFactoryReset()) {
+    resetKeyState();
     sleep();
   }
 
